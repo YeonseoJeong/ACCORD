@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environments
+.venv/
+venv/
+envs/
+
+# IDE
+.vscode/
+.idea/
+
+# Experiment outputs
+logs/
+runs/
+checkpoints/
+wandb/
+
+# Model files
+*.pt
+*.pth
+*.ckpt
+
+# Secrets
+.env
+*.pem

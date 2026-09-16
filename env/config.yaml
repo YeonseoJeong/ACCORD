@@ -1,0 +1,78 @@
+# ACCORD / O-RAN load-balancing environment configuration
+
+seed: 0
+
+network:
+  num_cells: 7
+  inter_site_distance_m: 200.0
+  carrier_frequency_hz: 3.5e9
+  bandwidth_hz: 20.0e6
+  num_prbs: 100
+  prb_bandwidth_hz: 180.0e3
+  cell_tx_power_dbm: 30.0        # total cell Tx power: 1 W
+  pathloss_exponent: 3.5
+  shadowing_std_db: 8.0
+  noise_psd_dbm_per_hz: -174.0
+  noise_figure_db: 7.0
+  rsrp_min_dbm: -110.0
+  num_ues: 100
+  mobility_std_m_per_slot: 1.0
+  slot_duration_s: 1.0
+
+traffic_service:
+  nominal_demand_bps: 2.0e6
+  profile_floor: 0.2
+  cycle_length_slots: 3600
+  peak_time:
+    distribution: uniform
+    low: 0
+    high: cycle_length_slots
+  service_fraction_beta: 0.8
+  service_level_vmax: 0.05
+  handover_weight: 0.1
+
+control:
+  cio_min_db: -6.0
+  cio_max_db: 6.0
+  cio_step_db: 1.0
+  es_epoch_slots: 60
+  dwell_time_slots: 300
+  demand_window_slots: 10
+
+power:
+  active_fixed_power_w: 30.0
+  load_slope: 4.0
+  sleep_power_w: 5.0
+  transition_cost_j: 20.0
+
+accord_training:
+  actor_learning_rate: 3.0e-4
+  critic_learning_rate: 1.0e-3
+  gamma: 0.99
+  gamma_es: 0.98
+  gae_lambda: 0.95
+  clip_epsilon: 0.2
+  entropy_beta: 0.01
+  update_iterations: 4
+  rollout_slots: 3600
+  parallel_envs: 16
+  minibatch_mlb: 512
+  minibatch_es: 64
+  hidden_size: 128
+  dual_step_size: 0.01
+  smoothing_kappa: 0.1
+  training_iterations: 500
+  seeds: 5
+
+implementation:
+  reference_distance_m: 1.0
+  pathloss_reference: "fspl"
+
+  ue_region: "seven_hexagons"
+  mobility_boundary: "reject"  # reject over boundary moving and keep the previous position.
+
+  initial_all_cells_on: true
+  initial_cio_db: 0.0
+
+  # Default: draw one UE-cell shadowing realization per episode to avoid
+  shadowing_mode: "episode_static"
