@@ -18,8 +18,8 @@ def main():
     for t in range(env.T):
         # Simple smoke-test controller:
         # keep all cells ON and CIO=0.
-        es_action = np.ones(env.B, dtype=np.int64) if t % env.K == 0 else None
-        mlb_action = np.zeros(env.B, dtype=np.float64)
+        es_action = np.ones(env.B, dtype=np.int64) if t % env.K == 0 else None # 60 slots 마다 on
+        mlb_action = np.zeros(env.B, dtype=np.float64) # cio = 0 dB
 
         obs, rewards, terminated, truncated, info = env.step(
             {"es": es_action, "mlb": mlb_action}

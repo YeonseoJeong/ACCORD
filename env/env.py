@@ -139,7 +139,7 @@ class ORANLoadBalancingEnv:
         # FSPL(d0) implementation assumption.
         c0 = 299_792_458.0
         wavelength = c0 / self.fc
-        self.pl0_db = 20.0 * math.log10(4.0 * math.pi * self.d0 / wavelength)
+        self.pl0_db = 20.0 * math.log10(4.0 * math.pi * self.d0 / wavelength) # reference path loss
 
         # Max reference in Eq. (12), all active and fully loaded.
         self.energy_norm_den = self.B * (
@@ -195,8 +195,10 @@ class ORANLoadBalancingEnv:
         """
         Returns
         -------
-        gain_linear: (U,B)
-        rsrp_dbm:    (U,B), based on per-PRB transmit power
+            step 1: distance: (U,B) distance matrix, minimum distance d0
+            step 2: pl_db: (U,B) path loss in dB + shadowing in dB
+            step 3: gain_linear: (U,B) linear channel gain, based on per-PRB transmit power
+            step 4: rsrp_dbm: (U,B) RSRP in dBm, used for association and outage detection
         """
         d = np.linalg.norm(
             self.ue_xy[:, None, :] - self.cell_xy[None, :, :], axis=-1
@@ -217,27 +219,28 @@ class ORANLoadBalancingEnv:
         gain_linear = 10.0 ** ((-pl_db + shadow_db) / 10.0)
         return gain_linear, rsrp_dbm
 
-    def _traffic_demand(self, t: int) -> np.ndarray: # (U, )
+    def _traffic_demand(self, t: int) -> np.ndarray:
         """
-        Eq. (48): each UE follows the diurnal profile of the cell nearest to
-        its initial position.
+            Eq. (48): (U, ), each UE follows the diurnal profile of the cell nearest to its initial position.
+            0.4Mbps <= du,t <= 2.0 Mbps
         """
         phase = 2.0 * math.pi * (t - self.t_peak[self.home_cell]) / self.T
         xi = self.xi_min + (1.0 - self.xi_min) * (1.0 + np.cos(phase)) / 2.0
-        return self.nominal_demand * xi     # 0.4Mbps <= du,t <= 2.0 Mbps
+        return self.nominal_demand * xi
 
     def _associate(
         self, rsrp_dbm: np.ndarray, cio_db: np.ndarray
     ) -> Tuple[np.ndarray, np.ndarray]: 
         '''
-        serving[u] = 0, 1, ..., B-1: UE u is served by cell serving[u]
-        serving[u] = -1: UE u is in outage 
+            Associate each UE with the best serving cell based on RSRP and CIO.
+            serving[u] = 0, 1, ..., B-1: UE u is served by cell serving[u]
+            serving[u] = -1: UE u is in outage 
         '''
         active = np.flatnonzero(self.s == 1)
         serving = np.full(self.U, -1, dtype=np.int64) 
 
         if len(active) == 0:
-            return serving, np.ones(self.U, dtype=bool)
+            return serving, np.ones(self.U, dtype=bool) # serving = [-1, ...], outage = [True, ...]
 
         active_rsrp = rsrp_dbm[:, active]
         strongest_active = np.max(active_rsrp, axis=1)
@@ -255,8 +258,10 @@ class ORANLoadBalancingEnv:
         prev_load: np.ndarray,
     ) -> np.ndarray:
         """
-        Eq. (8)-(9), using previous-slot load in interference activity factor.
-        Returns per-PRB rates [bit/s] for all UEs; outage UEs get 0.
+            Compute SINR and rates for each UE.
+            Eq. (8)-(9), using previous-slot load in interference activity factor.
+            Returns per-PRB rates [bit/s] for all UEs; outage UEs get 0.
+            ru^prb(t) = W_prb * log2(1 + SINR_u(t))
         """
         rates = np.zeros(self.U, dtype=np.float64)
         active = np.flatnonzero(self.s == 1)
@@ -283,7 +288,10 @@ class ORANLoadBalancingEnv:
         demand: np.ndarray,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Eq. (10)-(11).
+            Compute the required PRBs and delivery for each UE.
+            req_prb Nu_prb(t) = du(t) / ru^prb(t)
+            Load rho_b(t) = sum_{u in cell b} Nu_prb(t) / N_prb
+            Delivered rate R_u(t) = du(t) / max(rho_b(t), 1)
         """
         req_prbs = np.zeros(self.U, dtype=np.float64)
         served = serving >= 0
@@ -337,7 +345,7 @@ class ORANLoadBalancingEnv:
     def _jain(x: np.ndarray) -> float: # BS load balancing 계산 - 고르게 분배 JFI = 1, 하나에 몰리면 JFI 낮아짐
         x = np.asarray(x, dtype=np.float64)
         denom = len(x) * np.sum(x * x)
-        if denom <= 1e-15:
+        if denom <= 1e-15: # all BS load = 0, JFI = 1.0
             return 1.0
         return float(np.sum(x) ** 2 / denom)
 
@@ -379,8 +387,8 @@ class ORANLoadBalancingEnv:
     # ------------------------------------------------------------------
     def _apply_es_action(self, requested: Optional[np.ndarray]) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Apply ES action at an ES epoch using the dwell mask of Eq. (29).
-        Returns (previous activation, eligibility mask).
+            Apply ES action at an ES epoch using the dwell mask of Eq. (29).
+            Returns (previous activation, eligibility mask).
         """
         prev_s = self.s.copy()
         eligible = self.dwell_timer >= self.Tdwell - 1
@@ -396,10 +404,7 @@ class ORANLoadBalancingEnv:
 
         self.s[eligible] = requested[eligible]
 
-        # Avoid the degenerate all-off action, which makes Eq. (6) trivially
-        # all-outage. This safeguard is implementation-side and can be removed
-        # if the policy should be allowed to switch every cell off.
-        if np.sum(self.s) == 0:
+        if np.sum(self.s) == 0: # 모든 cell이 off되면 가장 load가 높은 cell을 켬
             b = int(np.argmax(self.load))
             self.s[b] = 1
 
@@ -421,7 +426,7 @@ class ORANLoadBalancingEnv:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def reset(self, seed: Optional[int] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]:
+    def reset(self, seed: Optional[int] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]: # episode 초기화
         if seed is not None:
             self.seed = int(seed)
             self.rng = np.random.default_rng(self.seed)
@@ -451,7 +456,7 @@ class ORANLoadBalancingEnv:
             np.ones(self.B, dtype=np.int64)
             if self.initial_all_cells_on
             else np.zeros(self.B, dtype=np.int64)
-        )
+        ) 
         self.theta = np.full(self.B, self.initial_cio_db, dtype=np.float64)
 
         # Initialize cells as immediately eligible. The paper gives the dwell
