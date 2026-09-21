@@ -37,7 +37,7 @@ class RuleBasedMLBController:
             raise ValueError("Expected cio_step > 0 and cio_min <= cio_max")
 
         distance = np.linalg.norm(xy[:, None, :] - xy[None, :, :], axis=-1) # (B, B) pairwise distance matrix
-        matrix = (distance > 1e-9) & np.isclose(distance, float(isd), rtol=1e-5, atol=1e-6) # boolean matrix indicating neighboring BSs
+        matrix = (distance > 1e-9) & np.isclose(distance, float(isd), rtol=1e-5, atol=1e-6) # neighboring BSs Db,j ≈ ISD
 
         self.neighbors = [np.flatnonzero(matrix[b]) for b in range(self.B)]
         self.max_idx = int(np.rint((self.cio_max - self.cio_min) / self.cio_step))
@@ -51,8 +51,8 @@ class RuleBasedMLBController:
         """
         Compute the next CIO values based on the current load and CIO values.
         """
-        load = np.asarray(obs["load"], dtype=np.float64)
-        cio = np.asarray(obs["cio_db"], dtype=np.float64)
+        load = np.asarray(obs["load"], dtype=np.float64)    # [0.65, 0.25, 0.80, 0.10, 0.35, 0.45, 0.20]
+        cio = np.asarray(obs["cio_db"], dtype=np.float64)   # [0, 0, 0, 0, 0, 0, 0]
 
         if load.shape != (self.B,) or cio.shape != (self.B,):
             raise ValueError("MLB observation arrays must have shape (B,)")

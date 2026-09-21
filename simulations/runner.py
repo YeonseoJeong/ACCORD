@@ -48,7 +48,7 @@ def run(
     else:
         es_controller = RuleBasedESController(
             env.cell_xy, env.isd, env.K, env.Tdwell,
-            off_threshold=0.2, on_threshold=0.8
+            off_threshold=0.2, on_threshold=0.6
         )
         mlb_controller = RuleBasedMLBController(
             env.cell_xy, env.isd,
@@ -75,6 +75,11 @@ def run(
         es_action = es_controller.act(make_es_observation(obs), t) # 60 slots마다 action, 그 외에는 None
         mlb_action = mlb_controller.act(make_mlb_observation(obs), t)
         prev_activation = obs["activation"].copy()
+        prev_dwell = obs["dwell_timer"].copy()
+        prev_load = obs["load"].copy()
+        diagnostic = None
+        if policy == "rule_based" and es_action is not None:
+            diagnostic = es_controller.last_decision
 
         obs, rewards, terminated, truncated, info = env.step( # runner -> env
             {"es": es_action, "mlb": mlb_action}
@@ -118,9 +123,13 @@ def run(
             for b in range(env.B):
                 requested = (int(es_action[b]) if es_action is not None else "")
                 eligible = (
-                    int(info["es_eligible_mask"][b])
-                    if info["es_epoch_start"]
-                    else ""
+                    int(info["es_eligible_mask"][b]) if info["es_epoch_start"] else ""
+                )
+                raw_action = (
+                    int(diagnostic["raw_requested"][b]) if diagnostic is not None else ""
+                )
+                blocked_dwell = (
+                    int(diagnostic["blocked_dwell"][b]) if diagnostic is not None else ""
                 )
 
                 cell_history.append({
@@ -133,11 +142,21 @@ def run(
                     "load": float(obs["load"][b]),
                     "activation": int(obs["activation"][b]),
                     "cio_db": float(obs["cio_db"][b]),
+                    "dwell_before":int(prev_dwell[b]),
+                    "dwell_timer":int(obs["dwell_timer"][b]),
+                    "load_before":float(prev_load[b]),
+                    "load":float(obs["load"][b]),
+
+                    "es_raw_action": raw_action,
                     "es_requested": requested,
+                    "es_applied": int(obs["activation"][b]),
                     "es_eligible": eligible,
+                    "es_blocked_dwell": blocked_dwell,
+
                     "switched": int(
                         obs["activation"][b] != prev_activation[b]
                     ),
+                    "es_safeguard":(int(diagnostic["safeguard_applied"]) if diagnostic is not None else "")
                 })
 
         if terminated or truncated:

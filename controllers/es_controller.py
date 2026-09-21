@@ -20,11 +20,14 @@ class AllOnESController:
 class RuleBasedESController:
     '''
         A rule-based controller for the Energy Saving (ES) component.
+        Network State = {BS load, Activation, dwell_timer}, BS action ∈ {0,1}B
         OFF: 최근 K slots 동안 load가 off_threshold보다 낮으면 OFF
         ON: 인접 BS 부하가 on_threshold보다 높으면 ON
-        Dwell time: 최소 dwell_slots 동안은 상태를 유지
+        Dwell Constraint: 최소 dwell_slots 동안은 상태를 유지
+        All-OFF safeguard: 모든 BS가 OFF되는 것을 방지
     '''
-    def __init__(self, cell_xy: np.ndarray, 
+    def __init__(self, 
+                 cell_xy: np.ndarray, 
                  isd: float, 
                  epoch_slots: int, 
                  dwell_slots: int, 
@@ -54,6 +57,7 @@ class RuleBasedESController:
     def reset(self) -> None:
         self._load_history = deque(maxlen=self.K)
         self._active_history = deque(maxlen=self.K)
+        self.last_decision = None
 
     def observe(self, obs: dict) -> None: # 과거 네트워크 상태 기억
         load = np.asarray(obs["load"], dtype=np.float64)
@@ -66,23 +70,26 @@ class RuleBasedESController:
         self._active_history.append(active.copy())
 
     def act(self, obs: dict, t: int) -> np.ndarray | None:
+
         if t % self.K != 0:
             return None
 
-        active = np.asarray(obs["activation"], dtype=np.int64)
-        load = np.asarray(obs["load"], dtype=np.float64)
-        dwell = np.asarray(obs["dwell_timer"], dtype=np.float64)
+        active = np.asarray(obs["activation"], dtype=np.int64)      # [1, 1, 1, 0, 1, 1, 1]
+        load = np.asarray(obs["load"], dtype=np.float64)            # [0.45, 0.23, 0.71, 0.0, 0.85, 0.32, 0.51]
+        dwell = np.asarray(obs["dwell_timer"], dtype=np.float64)    # [300, 300, 300, 120, 300, 300, 300]
+
         if any(a.shape != (self.B,) for a in (active, load, dwell)):
             raise ValueError("ES observation arrays must have shape (B,)")
+
         if not np.all(np.isin(active, (0, 1))):
             raise ValueError("Activation values must be 0 or 1")
 
-        requested = active.copy()
         eligible = dwell >= self.Tdwell - 1
+        raw_requested = active.copy() # dwell 적용 전 on/off 판단
 
         for b in range(self.B): # BS ON 조건
-            if active[b] == 0 and eligible[b] and np.any(load[self.neighbors[b]] > self.on_threshold):
-                requested[b] = 1
+            if active[b] == 0 and np.any(load[self.neighbors[b]] > self.on_threshold):
+                raw_requested[b] = 1
 
         if len(self._load_history) == self.K: # BS OFF 조건
             low_throughout = np.all(
@@ -93,11 +100,26 @@ class RuleBasedESController:
                 np.stack(self._active_history, axis=0) == 1,
                 axis=0,
             )
-            to_switch_off = (active == 1) & eligible & low_throughout & active_throughout
-            requested[to_switch_off] = 0
+            raw_switch_off = (active == 1) & low_throughout & active_throughout
+            raw_requested[raw_switch_off] = 0
 
+        # dwell constraint 적용
+        requested = active.copy()
+        requested[eligible] = raw_requested[eligible]
+        blocked_dwell = (raw_requested != active) & (~eligible)
+
+        safeguard_applied = False
         if not np.any(requested) and np.any(active): # 모든 BS OFF 방지
             keep = int(np.argmax(np.where(active == 1, load, -np.inf)))
             requested[keep] = 1
+            safeguard_applied = True
 
+        self.last_decision = {
+            "raw_requested": raw_requested.copy(),
+            "requested": requested.copy(),
+            "eligible": eligible.copy(),
+            "blocked_dwell": blocked_dwell.copy(),
+            "dwell": dwell.copy(),
+            "safeguard_applied": safeguard_applied,
+        }
         return requested
