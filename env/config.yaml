@@ -17,16 +17,29 @@ network:
   rsrp_min_dbm: -110.0
   num_ues: 100
   mobility_std_m_per_slot: 1.0
-  slot_duration_s: 1.0
+  slot_duration_s: 1.0          # 1 second per slot
 
 traffic_service:
   nominal_demand_bps: 2.0e6
   profile_floor: 0.2
-  cycle_length_slots: 3600
+  diurnal_cycle_slots: 86400
+  # cycle_length_slots: 3600
+  start_time_resolution_minutes: 1
+  
   peak_time:
     distribution: uniform
-    low: 0
-    high: cycle_length_slots
+    low: 7.0
+    high: 23.0
+  
+  active_ue_schedule:
+    busy_start_hour: 7.0
+    busy_end_hour: 23.0
+    deep_night_start_hour: 1.0
+    deep_night_end_hour: 5.0
+    busy_active_ratio: 1.0          # 07-23: 100%
+    transition_active_ratio: 0.7    # 23-01 & 05-07: 70%
+    deep_night_active_ratio: 0.3    # 01-05: 30%
+  
   service_fraction_beta: 0.8
   service_level_vmax: 0.05
   handover_weight: 0.1

@@ -10,6 +10,15 @@ import numpy as np
 
 '''
     Controller와 Environment를 연결하는 Runner
+    training: python -m simulations.runner 
+        --policy rule_based 
+        --seed 0 
+    evaluation: python -m simulations.runner
+        --policy rule_based 
+        --seed 0 
+        --slots 86400
+        --start_hour 0 
+        --save_history
 '''
 def make_es_observation(obs: dict) -> dict: # env.state -> es_controller.observe()
     return {
@@ -29,7 +38,9 @@ def run(
         seed: int = 0, 
         config_path: str | Path | None = None,
         save_history: bool = False, 
-        output_dir: str | Path = "results"
+        output_dir: str | Path = "results",
+        slots: int | None = None,
+        start_hour: float | None = None,
     ) -> dict:
 
     if policy not in ("all_on", "rule_based"):
@@ -39,8 +50,19 @@ def run(
         root = Path(__file__).resolve().parents[1]
         config_path = root / "env" / "config.yaml"
 
-    env = load_env(config_path) 
-    obs, _ = env.reset(seed=seed)
+    env = load_env(config_path)
+
+    start_clock_slot = None
+    if start_hour is not None:
+        start_clock_slot = int(round(
+            (float(start_hour) % 24.0) * 3600.0 / env.slot_duration_s
+        )) % env.diurnal_cycle_slots
+
+    obs, reset_info = env.reset(
+        seed=seed,
+        start_clock_slot=start_clock_slot,
+        episode_length_slots=slots,
+    )
 
     if policy == "all_on":
         es_controller = AllOnESController(env.B, env.K)
@@ -99,6 +121,14 @@ def run(
 
             system_history.append({
                 "t": t,
+                "hour_of_day": info["hour_of_day"],
+                "hour_index": info["hour_index"],
+                "clock_slot": info["clock_slot"],
+                "traffic_profile_continuous": int(info["traffic_profile_continuous"]),
+                "mean_cell_traffic_factor": float(np.mean(info["cell_traffic_factor"])),
+                "num_active_ues": info["num_active_ues"],
+                "active_ue_ratio": info["active_ue_ratio"],
+                "target_active_ue_ratio": info["target_active_ue_ratio"],
                 "total_demand_mbps": np.sum(demand) / 1e6,
                 "total_delivered_mbps": np.sum(delivered) / 1e6,
                 "energy_w": metrics["energy_w"],
@@ -134,7 +164,9 @@ def run(
 
                 cell_history.append({
                     "t": t,
+                    "hour_of_day": info["hour_of_day"],
                     "bs": b,
+                    "traffic_factor": float(info["cell_traffic_factor"][b]),
                     "home_demand_mbps": home_demand[b] / 1e6,
                     "serving_demand_mbps": serving_demand[b] / 1e6,
                     "delivered_mbps": serving_delivered[b] / 1e6,
@@ -167,6 +199,7 @@ def run(
     result["slots"] = steps
     result["policy"] = policy
     result["seed"] = seed
+    result["start_hour"] = float(reset_info["start_hour_of_day"])
     result["service_limit_satisfied"] = result["service_degradation"] <= env.Vmax
 
     if save_history:
@@ -195,9 +228,20 @@ def main() -> None:
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--save_history", action="store_true")
     parser.add_argument("--output_dir", type=Path, default="results")
+    parser.add_argument(
+        "--slots", type=int, default=None,
+        help="Override episode length. Use 86400 for a full 24-hour evaluation when slot_duration_s=1.",
+    )
+    parser.add_argument(
+        "--start_hour", type=float, default=None,
+        help="Optional physical start time in hours [0,24). Training/default reset samples this randomly.",
+    )
     args = parser.parse_args()
 
-    result = run(args.policy, args.seed, args.config, args.save_history, args.output_dir)
+    result = run(
+        args.policy, args.seed, args.config, args.save_history, args.output_dir,
+        slots=args.slots, start_hour=args.start_hour,
+    )
     for name, value in result.items():
         print(f"{name:>25s}: {value}")
 

@@ -89,16 +89,34 @@ class ORANLoadBalancingEnv:
 
         self.nominal_demand = float(ts["nominal_demand_bps"])
         self.xi_min = float(ts["profile_floor"])
-        self.T = int(ts["cycle_length_slots"])
+
+        self.slot_duration_s = float(n["slot_duration_s"])
+        self.episode_length_slots = int(self.cfg["accord_training"]["rollout_slots"])
+        self.T = self.episode_length_slots  # backward-compatible alias used by runners
+        self.diurnal_cycle_slots = int(ts["diurnal_cycle_slots"])
+        self.start_time_resolution_minutes = int(ts.get("start_time_resolution_minutes", 1)) # 분 단위로 학습 시작 가능
+
+        if self.diurnal_cycle_slots <= 0:
+            raise ValueError("diurnal_cycle_slots must be positive.")
+
+        activity_cfg = ts["active_ue_schedule"]
+        self.busy_start_hour = float(activity_cfg["busy_start_hour"])
+        self.busy_end_hour = float(activity_cfg["busy_end_hour"])
+        self.deep_night_start_hour = float(activity_cfg["deep_night_start_hour"])
+        self.deep_night_end_hour = float(activity_cfg["deep_night_end_hour"])
+        self.busy_active_ratio = float(activity_cfg["busy_active_ratio"])
+        self.transition_active_ratio = float(activity_cfg["transition_active_ratio"])
+        self.deep_night_active_ratio = float(activity_cfg["deep_night_active_ratio"])
 
         peak_cfg = ts["peak_time"]
         self.peak_time_distribution = str(peak_cfg["distribution"]).lower()
-        self.peak_time_low = float(peak_cfg["low"])
-        peak_time_high = peak_cfg["high"]
-        if isinstance(peak_time_high, str):
-            self.peak_time_high = float(ts[peak_time_high])
-        else:
-            self.peak_time_high = float(peak_time_high)
+        self.peak_time_low_hour = float(peak_cfg["low"])
+        self.peak_time_high_hour = float(peak_cfg["high"])
+        self.peak_time_low = self.peak_time_low_hour * 3600.0 / self.slot_duration_s
+        self.peak_time_high = self.peak_time_high_hour * 3600.0 / self.slot_duration_s   # t_peak: [25200, 82800)
+
+        if not (0.0 <= self.peak_time_low_hour < self.peak_time_high_hour <= 24.0):
+            raise ValueError("peak_time low_hour/high_hour must satisfy 0 <= low < high <= 24.")
 
         self.beta = float(ts["service_fraction_beta"])
         self.Vmax = float(ts["service_level_vmax"])
@@ -219,36 +237,87 @@ class ORANLoadBalancingEnv:
         gain_linear = 10.0 ** ((-pl_db + shadow_db) / 10.0)
         return gain_linear, rsrp_dbm
 
-    def _traffic_demand(self, t: int) -> np.ndarray:
+    def _clock_slot(self, t: int) -> int:
+        """Physical slot-of-day corresponding to episode-relative slot t."""
+        return int((self.start_clock_slot + t) % self.diurnal_cycle_slots)
+
+    def _hour_of_day(self, t: int) -> float:
+        seconds = self._clock_slot(t) * self.slot_duration_s
+        return (seconds / 3600.0) % 24.0
+
+    def _hour_index(self, t: int) -> int:
+        return int(math.floor(self._hour_of_day(t))) % 24
+
+    def _target_active_ratio(self, t: int) -> float: # 현재 시간 기준 몇 %의 UE가 active인지 결정
+        """Time-of-day UE activity schedule: 100%, 70%, or 30%."""
+        hour = self._hour_of_day(t)
+        if self.busy_start_hour <= hour < self.busy_end_hour:
+            return self.busy_active_ratio
+        if self.deep_night_start_hour <= hour < self.deep_night_end_hour:
+            return self.deep_night_active_ratio
+        return self.transition_active_ratio
+
+    def _active_ue_mask(self, t: int) -> np.ndarray:
+        # ue_acitivity_mask: reset()에서 랜덤하게 정해진 ue 순위
+        ratio = self._target_active_ratio(t)
+        num_active = int(round(ratio * self.U))
+        return self.ue_activity_rank < num_active # 활성화 비율 안으로 active 
+
+    def _cell_traffic_factor(self, t: int) -> np.ndarray:
         """
-            Eq. (48): (U, ), each UE follows the diurnal profile of the cell nearest to its initial position.
-            0.4Mbps <= du,t <= 2.0 Mbps
+        Continuous 24-hour cell-specific cosine traffic profile.
+        T=86400 기준 cosine profile로 변화하는데 매 슬롯마다 traffic profile 함수를 호출
         """
-        phase = 2.0 * math.pi * (t - self.t_peak[self.home_cell]) / self.T
-        xi = self.xi_min + (1.0 - self.xi_min) * (1.0 + np.cos(phase)) / 2.0
-        return self.nominal_demand * xi
+        clock_slot = self._clock_slot(t)
+        phase = 2.0 * math.pi * (clock_slot - self.t_peak) / self.diurnal_cycle_slots
+        return self.xi_min + (1.0 - self.xi_min) * (1.0 + np.cos(phase)) / 2.0
+
+    def _traffic_demand(self, t: int, active_ue_mask: Optional[np.ndarray] = None) -> np.ndarray:
+        """
+            Compute the traffic demand for each UE at time t.
+            du,t = au(t) * dbar * xi_homecell(t)
+        """
+        if active_ue_mask is None:
+            active_ue_mask = self._active_ue_mask(t)
+        xi_cell = self._cell_traffic_factor(t)
+        demand = self.nominal_demand * xi_cell[self.home_cell]
+        return np.where(active_ue_mask, demand, 0.0)
 
     def _associate(
-        self, rsrp_dbm: np.ndarray, cio_db: np.ndarray
+        self, rsrp_dbm: np.ndarray, cio_db: np.ndarray,
+        active_ue_mask: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]: 
         '''
             Associate each UE with the best serving cell based on RSRP and CIO.
             serving[u] = 0, 1, ..., B-1: UE u is served by cell serving[u]
             serving[u] = -1: UE u is in outage 
+            모든 ue에 대해 결정X, active_ue에 대해서만 ua 결정, inactive ue(serving=-1, outage=False)
         '''
-        active = np.flatnonzero(self.s == 1)
-        serving = np.full(self.U, -1, dtype=np.int64) 
+        if active_ue_mask is None:
+            active_ue_mask = np.ones(self.U, dtype=bool)
+        active_ue_mask = np.asarray(active_ue_mask, dtype=bool)
 
-        if len(active) == 0:
-            return serving, np.ones(self.U, dtype=bool) # serving = [-1, ...], outage = [True, ...]
+        active_cells = np.flatnonzero(self.s == 1)
+        active_users = np.flatnonzero(active_ue_mask) # active_ue만 ho 계산
+        serving = np.full(self.U, -1, dtype=np.int64)
+        outage = np.zeros(self.U, dtype=bool)
 
-        active_rsrp = rsrp_dbm[:, active]
+        # Inactive UEs are neither served nor counted as outage.
+        if len(active_users) == 0:
+            return serving, outage
+        if len(active_cells) == 0:
+            outage[active_users] = True
+            return serving, outage
+
+        active_rsrp = rsrp_dbm[np.ix_(active_users, active_cells)]
         strongest_active = np.max(active_rsrp, axis=1)
-        outage = strongest_active < self.rsrp_min_dbm # outage: serving cell의 RSRP가 threshold보다 낮으면 outage
+        user_outage = strongest_active < self.rsrp_min_dbm
 
-        score = active_rsrp + cio_db[active][None, :]
+        score = active_rsrp + cio_db[active_cells][None, :]
         best_local = np.argmax(score, axis=1)
-        serving[~outage] = active[best_local[~outage]] # outage가 아닌 UE에 대해 serving cell 결정
+        served_users = active_users[~user_outage]
+        serving[served_users] = active_cells[best_local[~user_outage]]
+        outage[active_users[user_outage]] = True
         return serving, outage
 
     def _sinr_and_rates(
@@ -311,10 +380,27 @@ class ORANLoadBalancingEnv:
     # ------------------------------------------------------------------
     # Metrics and state
     # ------------------------------------------------------------------
-    def _compute_handover_rate(self, serving: np.ndarray, outage: np.ndarray) -> float:
+    def _compute_handover_rate(
+        self,
+        serving: np.ndarray,
+        outage: np.ndarray,
+        active_ue_mask: Optional[np.ndarray] = None,
+    ) -> float:
+        if active_ue_mask is None:
+            active_ue_mask = np.ones(self.U, dtype=bool)
+        active_ue_mask = np.asarray(active_ue_mask, dtype=bool)
+        active_users = np.flatnonzero(active_ue_mask)
+        if len(active_users) == 0:
+            self.last_serving[:] = -1
+            return 0.0
+
+        # ue가 inactive 상태가 되면 기존 session을 끊고 serving=-1
+        # 다시 active 상태가 되면 새로 serving 결정, ho로 계산 안함
+        self.last_serving[~active_ue_mask] = -1
+
         handovers = 0
-        for u in range(self.U):
-            if outage[u]:
+        for u in active_users:
+            if outage[u] or serving[u] < 0:
                 continue
 
             if self.last_serving[u] >= 0 and serving[u] != self.last_serving[u]:
@@ -322,7 +408,7 @@ class ORANLoadBalancingEnv:
 
             self.last_serving[u] = serving[u]
 
-        return handovers / self.U
+        return handovers / len(active_users)
 
     def _compute_energy(self, prev_s: np.ndarray, load: np.ndarray) -> Tuple[float, float, int]:
         switching_count = int(np.sum(np.abs(self.s - prev_s)))
@@ -426,12 +512,31 @@ class ORANLoadBalancingEnv:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
-    def reset(self, seed: Optional[int] = None) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]: # episode 초기화
+    def reset(
+        self,
+        seed: Optional[int] = None,
+        start_clock_slot: Optional[int] = None,
+        episode_length_slots: Optional[int] = None,
+    ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any]]: # episode 초기화
         if seed is not None:
             self.seed = int(seed)
             self.rng = np.random.default_rng(self.seed)
 
         self.t = 0
+        self.episode_length_slots = int(
+            self.cfg["accord_training"]["rollout_slots"]
+            if episode_length_slots is None
+            else episode_length_slots
+        )
+        self.T = self.episode_length_slots
+
+        if start_clock_slot is None:
+            slots_per_minute = int(round(60.0 / self.slot_duration_s))      # 60 slots/min
+            resolution_slots = self.start_time_resolution_minutes * slots_per_minute
+            choices = self.diurnal_cycle_slots // resolution_slots
+            self.start_clock_slot = int(self.rng.integers(0, choices) * resolution_slots)
+        else:
+            self.start_clock_slot = int(start_clock_slot) % self.diurnal_cycle_slots
 
         self.ue_xy = self._sample_ue_positions()
         self.initial_ue_xy = self.ue_xy.copy()
@@ -446,11 +551,16 @@ class ORANLoadBalancingEnv:
         if self.peak_time_distribution == "uniform":
             self.t_peak = self.rng.uniform(
                 self.peak_time_low, self.peak_time_high, size=self.B
-            )
+            ) # 각 BS 마다 peak time 다르게 해서 spatial imbalance 유지됨
         else:
             raise NotImplementedError(
                 f"Unknown peak-time distribution: {self.peak_time_distribution}"
             )
+
+        # 100명에게 랜덤 순위 생성 30명 ⊂ 70명 ⊂ 100명 
+        order = self.rng.permutation(self.U)
+        self.ue_activity_rank = np.empty(self.U, dtype=np.int64)
+        self.ue_activity_rank[order] = np.arange(self.U, dtype=np.int64)
 
         self.s = (
             np.ones(self.B, dtype=np.int64)
@@ -472,8 +582,9 @@ class ORANLoadBalancingEnv:
         # Warm-start state by evaluating the initial configuration once
         # without advancing mobility/time or counting handovers.
         gain, rsrp = self._large_scale_gain()
-        demand = self._traffic_demand(0)
-        serving, outage = self._associate(rsrp, self.theta)
+        active_ue_mask = self._active_ue_mask(0)
+        demand = self._traffic_demand(0, active_ue_mask)
+        serving, outage = self._associate(rsrp, self.theta, active_ue_mask)
         per_prb_rate = self._sinr_and_rates(gain, serving, self.prev_load)
         self.load, _, _ = self._load_and_delivery(serving, per_prb_rate, demand)
         self.prev_load = self.load.copy()
@@ -483,6 +594,12 @@ class ORANLoadBalancingEnv:
             "t_peak": self.t_peak.copy(),
             "cell_positions_m": self.cell_xy.copy(),
             "cio_values_db": self.cio_values.copy(),
+            "start_clock_slot": self.start_clock_slot,
+            "start_hour_of_day": self._hour_of_day(0),
+            "episode_length_slots": self.episode_length_slots,
+            "active_ue_ratio": float(np.mean(active_ue_mask)),
+            "target_active_ue_ratio": self._target_active_ratio(0),
+            "cell_traffic_factor": self._cell_traffic_factor(0).copy(),
         }
         return self._get_state(), info
 
@@ -502,7 +619,14 @@ class ORANLoadBalancingEnv:
     def step(
         self, action: Dict[str, Optional[np.ndarray]]
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, float], bool, bool, Dict[str, Any]]:
-        if self.t >= self.T:
+        '''
+            ES action -> MLB action -> channel 계산
+            -> active ue 결정 -> cosine traffic 계산
+            -> active ue association -> sinr/per-prb rate
+            -> load/delivery -> handover rate, service degradation, energy, reward
+            -> dwell timer update -> ue mobility
+        '''
+        if self.t >= self.episode_length_slots:
             raise RuntimeError("Episode is done. Call reset().")
 
         prev_s = self.s.copy()
@@ -518,18 +642,32 @@ class ORANLoadBalancingEnv:
         self._apply_mlb_action(action["mlb"])
 
         gain, rsrp = self._large_scale_gain()
-        demand = self._traffic_demand(self.t)
-        serving, outage = self._associate(rsrp, self.theta)
+        active_ue_mask = self._active_ue_mask(self.t)
+        demand = self._traffic_demand(self.t, active_ue_mask)
+        serving, outage = self._associate(rsrp, self.theta, active_ue_mask)
         per_prb_rate = self._sinr_and_rates(gain, serving, self.prev_load)
         load, delivered, req_prbs = self._load_and_delivery(
             serving, per_prb_rate, demand
         )
 
-        handover_rate = self._compute_handover_rate(serving, outage)
+        handover_rate = self._compute_handover_rate(
+            serving, outage, active_ue_mask
+        )
 
-        below_min = (~outage) & (delivered < self.beta * demand)
-        V = float((np.sum(outage) + np.sum(below_min)) / self.U)
-        outage_fraction = float(np.mean(outage))
+        num_active = int(np.sum(active_ue_mask)) # service degradation -> active ue 기준
+        if num_active > 0:
+            below_min = (
+                active_ue_mask
+                & (~outage)
+                & (serving >= 0)
+                & (delivered < self.beta * demand)
+            )
+            active_outage = outage & active_ue_mask
+            V = float((np.sum(active_outage) + np.sum(below_min)) / num_active)
+            outage_fraction = float(np.sum(active_outage) / num_active)
+        else:
+            V = 0.0
+            outage_fraction = 0.0
 
         E, E_bar, switching_count = self._compute_energy(prev_s, load)
 
@@ -563,6 +701,15 @@ class ORANLoadBalancingEnv:
             "metrics": metrics.__dict__.copy(),
             "serving_cell": serving.copy(),
             "outage": outage.copy(),
+            "active_ue_mask": active_ue_mask.copy(),
+            "num_active_ues": num_active,
+            "active_ue_ratio": float(num_active / self.U),
+            "target_active_ue_ratio": float(self._target_active_ratio(self.t)),
+            "hour_of_day": float(self._hour_of_day(self.t)),
+            "hour_index": int(self._hour_index(self.t)),
+            "clock_slot": int(self._clock_slot(self.t)),
+            "traffic_profile_continuous": True,
+            "cell_traffic_factor": self._cell_traffic_factor(self.t).copy(),
             "delivered_rate_bps": delivered.copy(),
             "demand_bps": demand.copy(),
             "per_prb_rate_bps": per_prb_rate.copy(),
@@ -580,7 +727,7 @@ class ORANLoadBalancingEnv:
         }
 
         self.t += 1
-        terminated = self.t >= self.T
+        terminated = self.t >= self.episode_length_slots
         truncated = False
 
         if not terminated:
