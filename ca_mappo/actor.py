@@ -10,9 +10,6 @@
     MLB actor:
         pi_M(theta | o_M) = prod_b Categorical(theta_b; q_b)
         - one |Theta|-way categorical distribution per BS
-
-    The paper specifies MLPs and hidden size 128, but does not fix the number of hidden layers or activation. 
-    We use a configurable two-layer Tanh MLP by default, a standard PPO choice.
 """
 
 import __future__ as annotations
@@ -181,7 +178,7 @@ class MLBActor(nn.Module):
     def forward(self, obs: Tensor) -> Tensor:
         """Return per-BS logits, shape [N,B,A] (or [B,A] for unbatched input)."""
         obs_b, was_unbatched = _ensure_batch(obs)
-        logits = self.net(obs_b).view(-1, self.num_cells, self.num_actions)
+        logits = self.net(obs_b).view(-1, self.num_cells, self.num_cio)
         return logits.squeeze(0) if was_unbatched else logits
 
     @torch.no_grad()
