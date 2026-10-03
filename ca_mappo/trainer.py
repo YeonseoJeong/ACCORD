@@ -159,23 +159,34 @@ class CAMAPPOTrainer:
 
         cost_adv_epoch = epoch_average(cost_adv, self.K)
 
+        # Normalize advantages
         mlb_adv_n = normalize(mlb_adv)
         es_adv_n = normalize(es_adv)
         cost_adv_epoch_n = normalize(cost_adv_epoch)
+
+        # Normalize return targets
+        mlb_returns_n = normalize(mlb_returns)
+        es_returns_n = normalize(es_returns)
+        cost_returns_n = normalize(cost_returns)
 
         penalized_es_adv = (
             es_adv_n - self.lagrange_lambda * cost_adv_epoch_n
         ) / (1.0 + self.lagrange_lambda)
 
+        lambda_cost_adv = self.lagrange_lambda * cost_adv_epoch_n
+        constraint_dominance_frac = float(np.mean(np.abs(lambda_cost_adv) > np.abs(es_adv_n)))
+        sign_flip_frac = float(np.mean(np.sign(lambda_cost_adv) != np.sign(es_adv_n)))
+
+
         mlb_buffer.set_training_targets(
             advantages=mlb_adv_n,
-            returns=mlb_returns,
+            returns=mlb_returns_n,
             cost_advantages=cost_adv,
-            cost_returns=cost_returns,
+            cost_returns=cost_returns_n,
         )
         es_buffer.set_training_targets(
-            advantages=es_adv,
-            returns=es_returns,
+            advantages=es_adv_n,
+            returns=es_returns_n,
             penalized_advantages=penalized_es_adv,
         )
 
@@ -183,6 +194,21 @@ class CAMAPPOTrainer:
             "mean_mlb_adv": float(np.mean(mlb_adv)),
             "mean_es_adv": float(np.mean(es_adv)),
             "mean_cost_adv": float(np.mean(cost_adv)),
+            
+            "es_adv_norm_abs_mean": float(np.mean(np.abs(es_adv_n))),
+            "es_adv_norm_min": float(np.min(es_adv_n)),
+            "es_adv_norm_max": float(np.max(es_adv_n)),
+            "cost_adv_epoch_norm_abs_mean": float(np.mean(np.abs(cost_adv_epoch_n))),
+            "cost_adv_epoch_norm_min": float(np.min(cost_adv_epoch_n)),
+            "cost_adv_epoch_norm_max": float(np.max(cost_adv_epoch_n)),
+            "lambda_cost_adv_abs_mean": float(np.mean(np.abs(lambda_cost_adv))),
+            "lambda_cost_adv_min": float(np.min(lambda_cost_adv)),
+            "lambda_cost_adv_max": float(np.max(lambda_cost_adv)),
+            "penalized_es_adv_abs_mean": float(np.mean(np.abs(penalized_es_adv))),
+            "penalized_es_adv_min": float(np.min(penalized_es_adv)),
+            "penalized_es_adv_max": float(np.max(penalized_es_adv)),
+            "constraint_dominance_frac": constraint_dominance_frac,
+            "es_adv_sign_flip_frac": sign_flip_frac,
         }
 
     def update_dual(self, costs: list[float]) -> tuple[float, float]:

@@ -74,6 +74,7 @@ def train(
             seed=seed * 100000 + iteration,
             episode_length_slots=rollout_slots,
         )
+        start_hour = float(reset_info["start_hour_of_day"])
 
         mlb_buffer = MLBRolloutBuffer()
         es_buffer = ESRolloutBuffer()
@@ -95,6 +96,11 @@ def train(
         es_entropy_sum = 0.0
         mlb_entropy_sum = 0.0
         es_decisions = 0
+
+        es_epoch_rewards= []
+        mlb_rewards = []
+        v_values = []
+        wh_h_values = []
 
         for t in range(rollout_slots):
             state = make_rl_state(obs, env)
@@ -147,6 +153,12 @@ def train(
             )
             done = bool(terminated or truncated)
 
+            mlb_rewards.append(rewards["mlb"])
+            V_t = float(info["metrics"]["service_degradation"])
+            H_t = float(info["metrics"]["handover_rate"])
+            v_values.append(V_t)
+            wh_h_values.append(env.wh * H_t)
+
             mlb_buffer.add(
                 state=state,
                 action=mlb_action_idx,
@@ -171,12 +183,15 @@ def train(
                 assert es_epoch_mask is not None
                 assert es_epoch_value is not None
 
+                es_epoch_reward = es_reward_acc / env.K
+                es_epoch_rewards.append(es_epoch_reward)
+
                 es_buffer.add(
                     state=es_epoch_state,
                     action=es_epoch_action,
                     old_log_prob=es_epoch_log_prob,
                     eligible_mask=es_epoch_mask,
-                    reward=es_reward_acc / env.K,
+                    reward=es_epoch_reward,
                     value=es_epoch_value,
                     done=done,
                 )
@@ -198,6 +213,14 @@ def train(
         )
 
         n_steps = len(mlb_buffer)
+
+        def stat_string(values):
+            x = np.asarray(values, dtype=np.float64)
+            return (
+                f"{x.mean():+.4f}±{x.std():.4f} "
+                f"[{x.min():+.4f},{x.max():+.4f}]"
+            )
+        
         print(
             f"[Iter {iteration:04d}] "
             f"E={metric_sums['normalized_energy']/n_steps:.4f} | "
@@ -213,6 +236,27 @@ def train(
             f"LV_C={stats['cost_critic_loss']:.4f} | "
             f"H_E={es_entropy_sum/max(es_decisions,1):.3f} | "
             f"H_M={mlb_entropy_sum/max(n_steps,1):.3f}"
+        )
+        print(
+            f"           "
+            f"StartHour={start_hour:.2f} | "
+            f"R_ESepoch={stat_string(es_epoch_rewards)} | "
+            f"V={stat_string(v_values)} | "
+            f"wH*H={stat_string(wh_h_values)} | "
+            f"R_MLB={stat_string(mlb_rewards)}"
+        )
+        print(
+            f"           "
+            f"Adv_ES={stats['es_adv_norm_abs_mean']:.3f} "
+            f"[{stats['es_adv_norm_min']:+.3f},{stats['es_adv_norm_max']:+.3f}] | "
+            f"Adv_C={stats['cost_adv_epoch_norm_abs_mean']:.3f} "
+            f"[{stats['cost_adv_epoch_norm_min']:+.3f},{stats['cost_adv_epoch_norm_max']:+.3f}] | "
+            f"lambda*Adv_C={stats['lambda_cost_adv_abs_mean']:.3f} "
+            f"[{stats['lambda_cost_adv_min']:+.3f},{stats['lambda_cost_adv_max']:+.3f}] | "
+            f"Adv_pen={stats['penalized_es_adv_abs_mean']:.3f} "
+            f"[{stats['penalized_es_adv_min']:+.3f},{stats['penalized_es_adv_max']:+.3f}] | "
+            f"Dom={100.0 * stats['constraint_dominance_frac']:.1f}% | "
+            f"Flip={100.0 * stats['es_adv_sign_flip_frac']:.1f}%"
         )
 
         if iteration % 10 == 0 or iteration == num_iterations:
