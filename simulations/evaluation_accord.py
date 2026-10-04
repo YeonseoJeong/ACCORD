@@ -166,7 +166,8 @@ def load_checkpoint_into_trainer(
         ("es_critic", ("es_critic", "es_critic_state_dict")),
         ("mlb_actor", ("mlb_actor", "mlb_actor_state_dict")),
         ("mlb_critic", ("mlb_critic", "mlb_critic_state_dict")),
-        ("cost_critic", ("cost_critic", "cost_critic_state_dict")),
+        ("es_cost_critic", ("es_cost_critic", "cost_critic", "cost_critic_state_dict")),
+        ("mlb_cost_critic", ("mlb_cost_critic", "cost_critic", "cost_critic_state_dict")),
     ]
 
     loaded_any = False
@@ -249,6 +250,8 @@ def evaluate_one_seed(
     power_w_hist = []
     service_deg_hist = []
     handover_rate_hist = []
+    mlb_handover_rate_hist = []
+    forced_es_handover_rate_hist = []
     outage_fraction_hist = []
     throughput_bps_hist = []
     demand_bps_hist = []
@@ -304,6 +307,7 @@ def evaluate_one_seed(
                 _es_log_prob,
                 _es_entropy,
                 _es_value,
+                _es_cost_value,
             ) = trainer.select_es_action(
                 state,
                 obs["activation"],
@@ -370,6 +374,20 @@ def evaluate_one_seed(
             keys=("handover_rate", "ho_rate"),
         )
         handover_rate_hist.append(_scalar(handover_rate))
+
+        mlb_handover_rate = _find_value(
+            metrics,
+            info,
+            keys=("mlb_handover_rate",),
+        )
+        mlb_handover_rate_hist.append(_scalar(mlb_handover_rate))
+
+        forced_es_handover_rate = _find_value(
+            metrics,
+            info,
+            keys=("forced_es_handover_rate",),
+        )
+        forced_es_handover_rate_hist.append(_scalar(forced_es_handover_rate))
 
         outage_fraction = _find_value(
             metrics,
@@ -632,6 +650,8 @@ def evaluate_one_seed(
             else _safe_nanmean(demand_satisfaction_hist)
         ),
         "handover_rate": _safe_nanmean(handover_rate_hist),
+        "mlb_handover_rate": _safe_nanmean(mlb_handover_rate_hist),
+        "forced_es_handover_rate": _safe_nanmean(forced_es_handover_rate_hist),
         "switching_count": switching_count,
         "env_switching_count": env_switching_count,
         "average_active_bs_count": _safe_nanmean(active_bs_count_hist),
@@ -712,6 +732,8 @@ def evaluate_one_seed(
         "power_w": np.asarray(power_w_hist, dtype=np.float32),
         "service_degradation": np.asarray(service_deg_hist, dtype=np.float32),
         "handover_rate": np.asarray(handover_rate_hist, dtype=np.float32),
+        "mlb_handover_rate": np.asarray(mlb_handover_rate_hist, dtype=np.float32),
+        "forced_es_handover_rate": np.asarray(forced_es_handover_rate_hist, dtype=np.float32),
         "outage_fraction": np.asarray(outage_fraction_hist, dtype=np.float32),
         "throughput_bps": np.asarray(throughput_bps_hist, dtype=np.float32),
         "demand_bps": np.asarray(demand_bps_hist, dtype=np.float32),

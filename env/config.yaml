@@ -72,8 +72,8 @@ accord_training:
   minibatch_mlb: 512
   minibatch_es: 64
   hidden_size: 128
-  dual_step_size: 0.01
-  smoothing_kappa: 0.1
+  dual_step_size: 0.05
+  smoothing_kappa: 0.3
   training_iterations: 500
   seeds: 5
 

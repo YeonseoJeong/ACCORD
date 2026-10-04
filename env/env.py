@@ -24,9 +24,13 @@ class StepMetrics:  # 환경 performance metrics
     energy_w: float             # Et
     service_degradation: float  # Vt
     outage_fraction: float      # Ot
-    handover_rate: float        # Ht
-    switching_count: int        
+    handover_rate: float        # total Ht
+    mlb_handover_rate: float    # Ht excluding forced HO from ES switch-off
+    forced_es_handover_rate: float
+    switching_count: int
     jain_load_fairness: float
+    active_load_fairness: float
+    load_balance_loss: float
 
 
 class ORANLoadBalancingEnv:
@@ -380,35 +384,55 @@ class ORANLoadBalancingEnv:
     # ------------------------------------------------------------------
     # Metrics and state
     # ------------------------------------------------------------------
-    def _compute_handover_rate(
+    def _compute_handover_rates(
         self,
         serving: np.ndarray,
         outage: np.ndarray,
+        prev_s: np.ndarray,
         active_ue_mask: Optional[np.ndarray] = None,
-    ) -> float:
+    ) -> tuple[float, float, float]:
+        """Return total, MLB-attributed, and forced-ES handover rates.
+
+        A handover is excluded from the MLB penalty only when the UE's previous
+        serving cell was switched OFF by the ES action in the current slot.
+        Handover to a newly switched-ON cell is not forced and therefore remains
+        part of the MLB handover cost.
+        """
         if active_ue_mask is None:
             active_ue_mask = np.ones(self.U, dtype=bool)
         active_ue_mask = np.asarray(active_ue_mask, dtype=bool)
         active_users = np.flatnonzero(active_ue_mask)
         if len(active_users) == 0:
             self.last_serving[:] = -1
-            return 0.0
+            return 0.0, 0.0, 0.0
 
-        # ue가 inactive 상태가 되면 기존 session을 끊고 serving=-1
-        # 다시 active 상태가 되면 새로 serving 결정, ho로 계산 안함
+        # If a UE becomes inactive, terminate the previous session. When it
+        # becomes active again, the new association is not counted as HO.
         self.last_serving[~active_ue_mask] = -1
 
-        handovers = 0
+        total_handovers = 0
+        forced_es_handovers = 0
+
         for u in active_users:
             if outage[u] or serving[u] < 0:
                 continue
 
-            if self.last_serving[u] >= 0 and serving[u] != self.last_serving[u]:
-                handovers += 1
+            old_bs = int(self.last_serving[u])
+            is_handover = old_bs >= 0 and int(serving[u]) != old_bs
+
+            if is_handover:
+                total_handovers += 1
+                forced_by_es = bool(prev_s[old_bs] == 1 and self.s[old_bs] == 0)
+                if forced_by_es:
+                    forced_es_handovers += 1
 
             self.last_serving[u] = serving[u]
 
-        return handovers / len(active_users)
+        denom = float(len(active_users))
+        total_rate = total_handovers / denom
+        forced_es_rate = forced_es_handovers / denom
+        mlb_rate = (total_handovers - forced_es_handovers) / denom
+        return total_rate, mlb_rate, forced_es_rate
 
     def _compute_energy(self, prev_s: np.ndarray, load: np.ndarray) -> Tuple[float, float, int]:
         switching_count = int(np.sum(np.abs(self.s - prev_s)))
@@ -650,8 +674,10 @@ class ORANLoadBalancingEnv:
             serving, per_prb_rate, demand
         )
 
-        handover_rate = self._compute_handover_rate(
-            serving, outage, active_ue_mask
+        handover_rate, mlb_handover_rate, forced_es_handover_rate = (
+            self._compute_handover_rates(
+                serving, outage, prev_s, active_ue_mask
+            )
         )
 
         num_active = int(np.sum(active_ue_mask)) # service degradation -> active ue 기준
@@ -671,7 +697,16 @@ class ORANLoadBalancingEnv:
 
         E, E_bar, switching_count = self._compute_energy(prev_s, load)
 
-        reward_mlb = -V - self.wh * handover_rate
+        active_load = load[self.s == 1]
+
+        if len(active_load) == 0:
+            raise RuntimeError("No active BS: all-off state should have been prevented.")
+        
+        mean_active_load = float(np.mean(active_load))
+        lb_loss = float(np.mean((active_load - mean_active_load) ** 2))
+
+        active_load_fairness = self._jain(active_load)
+        reward_mlb = -lb_loss - self.wh * mlb_handover_rate
         # Per-slot ES contribution; training can average this over K slots
         # exactly as Eq. (25) does.
         reward_es_slot = -E_bar
@@ -693,8 +728,12 @@ class ORANLoadBalancingEnv:
             service_degradation=V,
             outage_fraction=outage_fraction,
             handover_rate=handover_rate,
+            mlb_handover_rate=mlb_handover_rate,
+            forced_es_handover_rate=forced_es_handover_rate,
             switching_count=switching_count,
             jain_load_fairness=self._jain(load),
+            active_load_fairness=active_load_fairness,
+            load_balance_loss=lb_loss,
         )
 
         info = {

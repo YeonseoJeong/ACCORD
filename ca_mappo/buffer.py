@@ -18,10 +18,10 @@ Tensor = torch.Tensor
 @dataclass
 class MLBRolloutBuffer:
     '''
-        reward = -V - wh*H
+        reward = -L_LB - wh*H_MLB
         cost = V
         value = V_m(x_t)
-        cost_value = V_c(x_t)
+        cost_value = V_c^MLB(x_t)
     '''
     states: list[np.ndarray] = field(default_factory=list)
     actions: list[np.ndarray] = field(default_factory=list)
@@ -36,6 +36,7 @@ class MLBRolloutBuffer:
     returns: np.ndarray | None = None
     cost_advantages: np.ndarray | None = None
     cost_returns: np.ndarray | None = None
+    penalized_advantages: np.ndarray | None = None
 
     def add(
         self,
@@ -66,6 +67,7 @@ class MLBRolloutBuffer:
         returns: np.ndarray,
         cost_advantages: np.ndarray,
         cost_returns: np.ndarray,
+        penalized_advantages: np.ndarray,
     ) -> None:
         n = len(self)
         for name, arr in {
@@ -73,6 +75,7 @@ class MLBRolloutBuffer:
             "returns": returns,
             "cost_advantages": cost_advantages,
             "cost_returns": cost_returns,
+            "penalized_advantages": penalized_advantages,
         }.items():
             arr = np.asarray(arr, dtype=np.float32)
             if arr.shape != (n,):
@@ -85,7 +88,16 @@ class MLBRolloutBuffer:
         device: torch.device,
         shuffle: bool = True,
     ) -> Iterator[dict[str, Tensor]]:
-        if any(x is None for x in (self.advantages, self.returns, self.cost_advantages, self.cost_returns)):
+        if any(
+            x is None
+            for x in (
+                self.advantages,
+                self.returns,
+                self.cost_advantages,
+                self.cost_returns,
+                self.penalized_advantages,
+            )
+        ):
             raise RuntimeError("Call set_training_targets() before minibatches().")
 
         n = len(self)
@@ -107,6 +119,7 @@ class MLBRolloutBuffer:
                 "returns": torch.as_tensor(self.returns[idx], device=device),
                 "cost_advantages": torch.as_tensor(self.cost_advantages[idx], device=device),
                 "cost_returns": torch.as_tensor(self.cost_returns[idx], device=device),
+                "penalized_advantages": torch.as_tensor(self.penalized_advantages[idx], device=device),
             }
 
 
@@ -117,11 +130,15 @@ class ESRolloutBuffer:
     old_log_probs: list[float] = field(default_factory=list)
     eligible_masks: list[np.ndarray] = field(default_factory=list)
     rewards: list[float] = field(default_factory=list)
+    costs: list[float] = field(default_factory=list)
     values: list[float] = field(default_factory=list)
+    cost_values: list[float] = field(default_factory=list)
     dones: list[float] = field(default_factory=list)
 
     advantages: np.ndarray | None = None
     returns: np.ndarray | None = None
+    cost_advantages: np.ndarray | None = None
+    cost_returns: np.ndarray | None = None
     penalized_advantages: np.ndarray | None = None
 
     def add(
@@ -131,7 +148,9 @@ class ESRolloutBuffer:
         old_log_prob: float,
         eligible_mask: np.ndarray,
         reward: float,
+        cost: float,
         value: float,
+        cost_value: float,
         done: bool,
     ) -> None:
         self.states.append(np.asarray(state, dtype=np.float32).copy())
@@ -139,7 +158,9 @@ class ESRolloutBuffer:
         self.old_log_probs.append(float(old_log_prob))
         self.eligible_masks.append(np.asarray(eligible_mask, dtype=bool).copy())
         self.rewards.append(float(reward))
+        self.costs.append(float(cost))
         self.values.append(float(value))
+        self.cost_values.append(float(cost_value))
         self.dones.append(float(done))
 
     def __len__(self) -> int:
@@ -149,12 +170,16 @@ class ESRolloutBuffer:
         self,
         advantages: np.ndarray,
         returns: np.ndarray,
+        cost_advantages: np.ndarray,
+        cost_returns: np.ndarray,
         penalized_advantages: np.ndarray,
     ) -> None:
         n = len(self)
         for name, arr in {
             "advantages": advantages,
             "returns": returns,
+            "cost_advantages": cost_advantages,
+            "cost_returns": cost_returns,
             "penalized_advantages": penalized_advantages,
         }.items():
             arr = np.asarray(arr, dtype=np.float32)
@@ -168,7 +193,16 @@ class ESRolloutBuffer:
         device: torch.device,
         shuffle: bool = True,
     ) -> Iterator[dict[str, Tensor]]:
-        if any(x is None for x in (self.advantages, self.returns, self.penalized_advantages)):
+        if any(
+            x is None
+            for x in (
+                self.advantages,
+                self.returns,
+                self.cost_advantages,
+                self.cost_returns,
+                self.penalized_advantages,
+            )
+        ):
             raise RuntimeError("Call set_training_targets() before minibatches().")
 
         n = len(self)
@@ -190,5 +224,7 @@ class ESRolloutBuffer:
                 "eligible_masks": torch.as_tensor(eligible_masks[idx], device=device),
                 "advantages": torch.as_tensor(self.advantages[idx], device=device),
                 "returns": torch.as_tensor(self.returns[idx], device=device),
+                "cost_advantages": torch.as_tensor(self.cost_advantages[idx], device=device),
+                "cost_returns": torch.as_tensor(self.cost_returns[idx], device=device),
                 "penalized_advantages": torch.as_tensor(self.penalized_advantages[idx], device=device),
             }

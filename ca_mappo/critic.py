@@ -1,12 +1,13 @@
 """Centralized critics for ACCORD.
 
-ACCORD trains three scalar critics on the global state x_t:
-    1) ES value critic   V^E_psiE
-    2) MLB value critic  V^M_psiM
-    3) Cost critic       V^C_psiC
+ACCORD trains four scalar critics on the global state x_t:
+    1) ES objective critic      V^E
+    2) MLB objective critic     V^M
+    3) ES service-cost critic   V^{C,E}
+    4) MLB service-cost critic  V^{C,M}
 
-The three critics intentionally do NOT share their regression target.
-The cost critic estimates discounted service degradation V_t and is used only in the ES constrained update.
+The two cost critics estimate the same shared service-degradation signal at
+different action time scales: epoch-averaged for ES and slot-scale for MLB.
 """
 
 from __future__ import annotations
@@ -90,4 +91,4 @@ class MLBValueCritic(ValueCritic):
 
 
 class CostCritic(ValueCritic):
-    """V^C(x_t): predicts slot-scale service-degradation cost return."""
+    """Scalar service-degradation cost critic; time scale is set by its target."""

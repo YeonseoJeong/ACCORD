@@ -12,6 +12,9 @@ from pathlib import Path
 import numpy as np
 import torch
 
+import csv
+import matplotlib.pyplot as plt
+
 from ca_mappo.buffer import ESRolloutBuffer, MLBRolloutBuffer
 from ca_mappo.trainer import CAMAPPOTrainer
 from ca_mappo.utils import flatten_normalized_observation, set_seed
@@ -26,7 +29,6 @@ def make_rl_state(obs: dict, env) -> np.ndarray:
         nominal_demand_bps=env.nominal_demand,
         num_ues=env.U,
     )
-
 
 def train(
     *,
@@ -67,6 +69,45 @@ def train(
     print(f"State dim: {env.state_dim}, B={env.B}, K={env.K}, Tdwell={env.Tdwell}")
 
     checkpoint_dir = Path(checkpoint_dir)
+    # ----------------------------------------------------------
+    # Training log / figure directories
+    # ----------------------------------------------------------
+    run_dir = root / "results" / "training" / f"seed{seed}"
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    log_path = run_dir / "training_metrics.csv"
+
+    log_fields = [
+        "iteration",
+        "start_hour",
+        "E",
+        "V",
+        "HO",
+        "HO_M",
+        "HO_ES",
+        "LB",
+        "SW",
+        "lambda",
+        "Cema",
+        "Lpi_E",
+        "Lpi_M",
+        "LV_E",
+        "LV_M",
+        "LV_CE",
+        "LV_CM",
+        "R_ES",
+        "R_MLB",
+    ]
+
+    # New training run -> create CSV with header
+    with log_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=log_fields)
+        writer.writeheader()
+
+    history: list[dict] = []
+
+    print(f"Training log: {log_path}")
 
     for iteration in range(1, num_iterations + 1):
         # Different environment seed each rollout, reproducibly derived from base seed.
@@ -85,12 +126,17 @@ def train(
         es_epoch_log_prob: float | None = None
         es_epoch_mask: np.ndarray | None = None
         es_epoch_value: float | None = None
+        es_epoch_cost_value: float | None = None
         es_reward_acc = 0.0
+        es_cost_acc = 0.0
 
         metric_sums = {
             "normalized_energy": 0.0,
             "service_degradation": 0.0,
             "handover_rate": 0.0,
+            "mlb_handover_rate": 0.0,
+            "forced_es_handover_rate": 0.0,
+            "load_balance_loss": 0.0,
             "switching_count": 0.0,
         }
         es_entropy_sum = 0.0
@@ -116,6 +162,7 @@ def train(
                     es_log_prob,
                     es_entropy,
                     es_value,
+                    es_cost_value,
                 ) = trainer.select_es_action(
                     state,
                     obs["activation"],
@@ -128,7 +175,9 @@ def train(
                 es_epoch_log_prob = es_log_prob
                 es_epoch_mask = eligible_mask.copy()
                 es_epoch_value = es_value
+                es_epoch_cost_value = es_cost_value
                 es_reward_acc = 0.0
+                es_cost_acc = 0.0
                 es_entropy_sum += es_entropy
                 es_decisions += 1
 
@@ -155,9 +204,9 @@ def train(
 
             mlb_rewards.append(rewards["mlb"])
             V_t = float(info["metrics"]["service_degradation"])
-            H_t = float(info["metrics"]["handover_rate"])
+            H_mlb_t = float(info["metrics"]["mlb_handover_rate"])
             v_values.append(V_t)
-            wh_h_values.append(env.wh * H_t)
+            wh_h_values.append(env.wh * H_mlb_t)
 
             mlb_buffer.add(
                 state=state,
@@ -170,8 +219,10 @@ def train(
                 done=done,
             )
 
-            # Eq. (19): epoch ES reward = average of slot energy rewards.
+            # ES acts once per K slots, so both its local reward and shared
+            # service cost are aggregated on the same epoch time scale.
             es_reward_acc += rewards["es_slot"]
+            es_cost_acc += rewards["constraint_cost"]
 
             for key in metric_sums:
                 metric_sums[key] += float(info["metrics"][key])
@@ -182,8 +233,10 @@ def train(
                 assert es_epoch_log_prob is not None
                 assert es_epoch_mask is not None
                 assert es_epoch_value is not None
+                assert es_epoch_cost_value is not None
 
                 es_epoch_reward = es_reward_acc / env.K
+                es_epoch_cost = es_cost_acc / env.K
                 es_epoch_rewards.append(es_epoch_reward)
 
                 es_buffer.add(
@@ -192,7 +245,9 @@ def train(
                     old_log_prob=es_epoch_log_prob,
                     eligible_mask=es_epoch_mask,
                     reward=es_epoch_reward,
+                    cost=es_epoch_cost,
                     value=es_epoch_value,
+                    cost_value=es_epoch_cost_value,
                     done=done,
                 )
 
@@ -208,11 +263,45 @@ def train(
             mlb_buffer,
             es_buffer,
             next_mlb_value=0.0,
-            next_cost_value=0.0,
+            next_mlb_cost_value=0.0,
             next_es_value=0.0,
+            next_es_cost_value=0.0,
         )
 
         n_steps = len(mlb_buffer)
+        log_row = {
+            "iteration": iteration,
+            "start_hour": start_hour,
+
+            "E": metric_sums["normalized_energy"] / n_steps,
+            "V": metric_sums["service_degradation"] / n_steps,
+            "HO": metric_sums["handover_rate"] / n_steps,
+            "HO_M": metric_sums["mlb_handover_rate"] / n_steps,
+            "HO_ES": metric_sums["forced_es_handover_rate"] / n_steps,
+            "LB": metric_sums["load_balance_loss"] / n_steps,
+            "SW": metric_sums["switching_count"],
+
+            "lambda": stats["lagrange_lambda"],
+            "Cema": stats["cost_ema"],
+
+            "Lpi_E": stats["es_actor_loss"],
+            "Lpi_M": stats["mlb_actor_loss"],
+
+            "LV_E": stats["es_critic_loss"],
+            "LV_M": stats["mlb_critic_loss"],
+            "LV_CE": stats["es_cost_critic_loss"],
+            "LV_CM": stats["mlb_cost_critic_loss"],
+
+            "R_ES": float(np.mean(es_epoch_rewards)),
+            "R_MLB": float(np.mean(mlb_rewards)),
+        }
+
+        history.append(log_row)
+
+        # Save every iteration so data survive even if training stops.
+        with log_path.open("a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=log_fields)
+            writer.writerow(log_row)
 
         def stat_string(values):
             x = np.asarray(values, dtype=np.float64)
@@ -226,6 +315,9 @@ def train(
             f"E={metric_sums['normalized_energy']/n_steps:.4f} | "
             f"V={metric_sums['service_degradation']/n_steps:.4f} | "
             f"HO={metric_sums['handover_rate']/n_steps:.4f} | "
+            f"HO_M={metric_sums['mlb_handover_rate']/n_steps:.4f} | "
+            f"HO_ES={metric_sums['forced_es_handover_rate']/n_steps:.4f} | "
+            f"LB={metric_sums['load_balance_loss']/n_steps:.4f} | "
             f"SW={metric_sums['switching_count']:.0f} | "
             f"lambda={stats['lagrange_lambda']:.4f} | "
             f"Cema={stats['cost_ema']:.4f} | "
@@ -233,7 +325,8 @@ def train(
             f"Lpi_M={stats['mlb_actor_loss']:.4f} | "
             f"LV_E={stats['es_critic_loss']:.4f} | "
             f"LV_M={stats['mlb_critic_loss']:.4f} | "
-            f"LV_C={stats['cost_critic_loss']:.4f} | "
+            f"LV_CE={stats['es_cost_critic_loss']:.4f} | "
+            f"LV_CM={stats['mlb_cost_critic_loss']:.4f} | "
             f"H_E={es_entropy_sum/max(es_decisions,1):.3f} | "
             f"H_M={mlb_entropy_sum/max(n_steps,1):.3f}"
         )
@@ -247,23 +340,23 @@ def train(
         )
         print(
             f"           "
-            f"Adv_ES={stats['es_adv_norm_abs_mean']:.3f} "
-            f"[{stats['es_adv_norm_min']:+.3f},{stats['es_adv_norm_max']:+.3f}] | "
-            f"Adv_C={stats['cost_adv_epoch_norm_abs_mean']:.3f} "
-            f"[{stats['cost_adv_epoch_norm_min']:+.3f},{stats['cost_adv_epoch_norm_max']:+.3f}] | "
-            f"lambda*Adv_C={stats['lambda_cost_adv_abs_mean']:.3f} "
-            f"[{stats['lambda_cost_adv_min']:+.3f},{stats['lambda_cost_adv_max']:+.3f}] | "
-            f"Adv_pen={stats['penalized_es_adv_abs_mean']:.3f} "
-            f"[{stats['penalized_es_adv_min']:+.3f},{stats['penalized_es_adv_max']:+.3f}] | "
-            f"Dom={100.0 * stats['constraint_dominance_frac']:.1f}% | "
-            f"Flip={100.0 * stats['es_adv_sign_flip_frac']:.1f}%"
+            f"ES: Adv={stats['es_adv_norm_abs_mean']:.3f} | "
+            f"Adv_C={stats['es_cost_adv_norm_abs_mean']:.3f} | "
+            f"Adv_pen={stats['penalized_es_adv_abs_mean']:.3f} | "
+            f"Dom={100.0 * stats['es_constraint_dominance_frac']:.1f}% | "
+            f"Flip={100.0 * stats['es_adv_sign_flip_frac']:.1f}% || "
+            f"MLB: Adv={stats['mlb_adv_norm_abs_mean']:.3f} | "
+            f"Adv_C={stats['mlb_cost_adv_norm_abs_mean']:.3f} | "
+            f"Adv_pen={stats['penalized_mlb_adv_abs_mean']:.3f} | "
+            f"Dom={100.0 * stats['mlb_constraint_dominance_frac']:.1f}% | "
+            f"Flip={100.0 * stats['mlb_adv_sign_flip_frac']:.1f}%"
         )
 
         if iteration % 10 == 0 or iteration == num_iterations:
             trainer.save_checkpoint(
                 checkpoint_dir / f"accord_seed{seed}_iter{iteration}.pt",
                 iteration=iteration,
-            )
+            ) 
 
 
 if __name__ == "__main__":
