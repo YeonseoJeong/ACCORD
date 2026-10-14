@@ -18,6 +18,8 @@ results/
 plots/
 checkpoints/
 wandb/
+complexity_1000/
+runs_dynamic_*/
 
 # Model files
 *.pt
