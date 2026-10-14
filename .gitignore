@@ -20,6 +20,7 @@ checkpoints/
 wandb/
 complexity_1000/
 runs_dynamic_*/
+ys/
 
 # Model files
 *.pt
